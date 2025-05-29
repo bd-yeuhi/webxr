@@ -1,0 +1,327 @@
+<!doctype html>
+<html>
+
+<head>
+    <title>WebXR AR Cube - Quest Pro</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <style>
+        body {
+            margin: 0;
+            background-color: #000;
+            color: #fff;
+            font-family: sans-serif;
+        }
+
+        #webxr-button {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            border: 1px solid #fff;
+            border-radius: 4px;
+            background: rgba(0, 0, 0, 0.5);
+            color: #fff;
+            font-size: 16px;
+            cursor: pointer;
+            z-index: 9999;
+        }
+
+        #webxr-button:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            z-index: 100;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="info">
+        Point your Quest Pro and look around to see the cube in AR.
+    </div>
+    <button id="webxr-button">Enter AR</button>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.128.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.128.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script type="module">
+        // 2. Import THREE and XRControllerModelFactory using ES6 modules
+        import * as THREE from 'three';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+        let camera, scene, renderer;
+        let cube;
+        let xrSession = null;
+        let xrRefSpace = null;
+
+        let controller, controllerGrip;
+
+        const webXRButton = document.getElementById("webxr-button");
+        const infoElement = document.getElementById("info");
+
+        let lastAButtonPressed = false;
+        let previousBoxes = [];
+        let showPreviousBoxes = false;
+        let currentBox = null;
+
+        // Utility to convert degrees to radians
+        function degToRad(deg) {
+            return deg * Math.PI / 180;
+        }
+
+        // Add a new box at a random pose and orientation
+        function addRandomBox() {
+            // Box dimensions: [0.4, 0.2, 0.2]
+            const geometry = new THREE.BoxGeometry(0.4, 0.2, 0.2);
+            // 0x0077ff ≈ "deepskyblue"
+            const material = new THREE.MeshStandardMaterial({ color: "red", transparent: true, opacity: 0.5 });
+            const box = new THREE.Mesh(geometry, material);
+
+            // Define ranges for each axis and rotation
+            const x_range = [-1, 1];
+            const y_range = [0.3, 1.8];
+            const z_range = [-1.5, -0.3];
+            // Ranges in degrees
+            const pitch_range = [0, 0]; 
+            const roll_range = [-45, 45];
+            const yaw_range = [-45, 45];
+
+            // Random translation
+            box.position.x = Math.random() * (x_range[1] - x_range[0]) + x_range[0];
+            box.position.y = Math.random() * (y_range[1] - y_range[0]) + y_range[0];
+            box.position.z = Math.random() * (z_range[1] - z_range[0]) + z_range[0];
+
+            // Random orientation
+            const pitch = degToRad(Math.random() * (pitch_range[1] - pitch_range[0]) + pitch_range[0]);
+            const roll = degToRad(Math.random() * (roll_range[1] - roll_range[0]) + roll_range[0]);
+            const yaw = degToRad(Math.random() * (yaw_range[1] - yaw_range[0]) + yaw_range[0]);
+
+            box.rotation.set(pitch, yaw, roll, 'YXZ');
+
+            return box;
+        }
+
+        // Remove all boxes in the scene except the camera, lights, and controller models
+        function removeAllBoxes() {
+            scene.traverse(obj => {
+                if (obj.isMesh && obj !== cube && obj !== currentBox) {
+                    scene.remove(obj);
+                }
+            });
+            // Remove currentBox if present
+            if (currentBox && scene.children.includes(currentBox)) {
+                scene.remove(currentBox);
+            }
+        }
+
+        // Check for 'A' button press on the right controller and add a box if pressed
+        function checkAButtonPress() {
+            if (!xrSession) return;
+            const inputSources = xrSession.inputSources;
+            for (const source of inputSources) {
+                if (source && source.gamepad && source.handedness === "right") {
+                    // On Quest controllers, button 4 is 'A'
+                    const gamepad = source.gamepad;
+                    if (gamepad.buttons.length > 4) {
+                        const aButton = gamepad.buttons[4];
+                        if (aButton && aButton.pressed && !lastAButtonPressed) {
+                            // Store the current box (if any) before replacing
+                            if (currentBox) {
+                                previousBoxes.push(currentBox);
+                                scene.remove(currentBox);
+                            }
+                            // Add new box
+                            currentBox = addRandomBox();
+                            scene.add(currentBox);
+                            lastAButtonPressed = true;
+                        } else if (aButton && !aButton.pressed) {
+                            lastAButtonPressed = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Show or hide all previous boxes in the scene, and set their color to light purple when visible
+        function setPreviousBoxesVisibility(visible) {
+            previousBoxes.forEach(box => {
+                if (visible) {
+                    // Set color to light purple when showing
+                    if (box.material) {
+                        box.material.color.setStyle("plum"); // "plum" is a light purple CSS color
+                    }
+                    if (!scene.children.includes(box)) scene.add(box);
+                } else {
+                    if (scene.children.includes(box)) scene.remove(box);
+                }
+            });
+        }
+
+        async function init() {
+            if (navigator.xr) {
+                try {
+                    const supported = await navigator.xr.isSessionSupported(
+                        "immersive-ar"
+                    );
+                    // Check if immersive AR with local-floor is supported
+                    if (supported) {
+                        webXRButton.textContent = "Enter AR";
+                        webXRButton.disabled = false;
+                        webXRButton.addEventListener("click", onEnterAR);
+                    } else {
+                        webXRButton.textContent = "AR Not Supported";
+                        infoElement.innerHTML =
+                            "Immersive AR not supported on this device/browser.";
+                    }
+                } catch (e) {
+                    console.error("Error checking AR support:", e);
+                    webXRButton.textContent = "AR Not Supported";
+                    infoElement.innerHTML = "Error checking AR support. Check console.";
+                }
+            } else {
+                webXRButton.textContent = "WebXR Not Available";
+                infoElement.innerHTML =
+                    "WebXR API not available in this browser. <br>Try using the Meta Quest Browser on your Quest Pro.";
+            }
+
+            // Basic Three.js scene setup
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(
+                70,
+                window.innerWidth / window.innerHeight,
+                0.1,
+                1000,
+            );
+            scene.add(camera); // Add camera to scene so its transform is updated by WebXR
+
+            // Create a simple cube
+            const geometry = new THREE.BoxGeometry(0.2, 0.2, 0.2); // 20cm cube
+            const material = new THREE.MeshStandardMaterial({ color: "lime", transparent: true, opacity: 0.5 }); // Green
+            cube = new THREE.Mesh(geometry, material);
+            cube.position.set(0, 1, -1);
+            scene.add(cube);
+          
+
+            // Add some light
+            const ambientLight = new THREE.AmbientLight("white", 0.6);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight("white", 0.8);
+            directionalLight.position.set(1, 1, 1);
+            scene.add(directionalLight);
+
+            // Renderer setup
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Add controller objects to the scene after renderer is created
+            controller = renderer.xr.getController(0);
+            scene.add(controller);
+
+            controllerGrip = renderer.xr.getControllerGrip(0);
+            scene.add(controllerGrip);
+
+            // // Optional: Visualize the controller (Three.js provides a simple model)
+            // const controllerModelFactory = new XRControllerModelFactory();
+            // controllerModelFactory.path = 'https://unpkg.com/three@0.128.0/examples/models/gltf/'; // Add this line
+            // controllerGrip.add(controllerModelFactory.createControllerModel(controllerGrip));
+
+            // Listen for select events (trigger button)
+            controller.addEventListener('selectstart', onSelectStart);
+            controller.addEventListener('selectend', onSelectEnd);
+
+            window.addEventListener("resize", onWindowResize, false);
+        }
+
+        async function onEnterAR() {
+            if (!xrSession) {
+                try {
+                    // Request an 'immersive-ar' session
+                    // 'local-floor' is good for placing objects on a detected surface
+                    // 'dom-overlay' allows HTML elements to be shown over the AR view
+                    // 'camera-access' and 'passthrough' are implied for 'immersive-ar' on Quest.
+                    // For Quest Pro, explicit 'passthrough' is not strictly needed in recent versions
+                    // but 'local-floor' helps ground the experience.
+                    xrSession = await navigator.xr.requestSession("immersive-ar", {
+                        requiredFeatures: ["local-floor"], // 'hit-test' can be added for more advanced placement
+                        optionalFeatures: ["hand-tracking"], // Hand tracking is cool on Quest Pro!
+                    });
+
+                    xrSession.addEventListener("end", onSessionEnded);
+
+                    // Set the renderer's XR session
+                    await renderer.xr.setSession(xrSession);
+
+                    // Get a reference space
+                    xrRefSpace = await xrSession.requestReferenceSpace("local-floor");
+
+                    webXRButton.textContent = "Exit AR";
+                    infoElement.style.display = "none"; // Hide info text in AR
+
+                    // Start the render loop
+                    renderer.setAnimationLoop(render);
+                } catch (e) {
+                    console.error("Failed to start AR session:", e);
+                    infoElement.innerHTML = `Failed to start AR: ${e.message}`;
+                }
+            } else {
+                xrSession.end();
+            }
+        }
+
+        function onSessionEnded() {
+            xrSession = null;
+            renderer.xr.setSession(null); // Clear session from renderer
+            webXRButton.textContent = "Enter AR";
+            infoElement.style.display = "block";
+            renderer.setAnimationLoop(null); // Stop render loop
+            // Optionally, reset cube position or other scene elements
+            cube.position.set(0, 0, -1); // Reset cube position
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function render(timestamp, frame) {
+            if (!xrSession || !frame) return;
+
+            checkAButtonPress();
+
+            // Show/hide previous boxes depending on trigger state
+            setPreviousBoxesVisibility(showPreviousBoxes);
+
+            renderer.render(scene, camera);
+        }
+
+        function onSelectStart() {
+            // When trigger is pressed, show all previous boxes
+            showPreviousBoxes = true;
+        }
+
+        function onSelectEnd() {
+            // When trigger is released, hide all previous boxes
+            showPreviousBoxes = false;
+        }
+
+        init();
+    </script>
+</body>
+
+</html>
