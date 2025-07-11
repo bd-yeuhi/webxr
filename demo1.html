@@ -66,7 +66,8 @@
         let xrSession = null;
         let xrRefSpace = null;
 
-        let controller, controllerGrip;
+        let controllerLeft, controllerRight;
+        let controllerGripLeft, controllerGripRight;
 
         const webXRButton = document.getElementById("webxr-button");
         const infoElement = document.getElementById("info");
@@ -74,41 +75,9 @@
         let currentBox = null;
         let targetBox = null;
 
-        let hand0 = null;
-        let hand1 = null;
-        let hand0_handedness = null;
-        let hand1_handedness = null;
-        let hand0Model = null;
-        let hand1Model = null;
-
         let has_been_grasped = false;
 
-        // Detect if a hand is in a closed fist pose by thresholding finger joints
-        // Returns true if all fingertips are close to the palm (wrist)
-        function isHandFist(hand, threshold = 0.1) {
-            if (!hand || !hand.joints) return false;
-            // XRHand joint names for fingertips
-            const tipNames = [
-                'index-finger-tip',
-                'middle-finger-tip',
-                'ring-finger-tip',
-                'pinky-finger-tip'
-            ];
-            const wrist = hand.joints['wrist'];
-            if (!wrist) return false;
-            const wristPos = new THREE.Vector3();
-            wrist.getWorldPosition(wristPos);
-            for (const tipName of tipNames) {
-                const tip = hand.joints[tipName];
-                if (!tip) return false;
-                const tipPos = new THREE.Vector3();
-                tip.getWorldPosition(tipPos);
-                const dist = tipPos.distanceTo(wristPos);
-                //console.log(`Distance from ${tipName} to wrist: ${dist.toFixed(3)}m`);
-                if (dist > threshold) return false;
-            }
-            return true;
-        }
+        // No hand tracking: use controller trigger/button state instead
 
         // Utility to convert degrees to radians
         function degToRad(deg) {
@@ -135,6 +104,8 @@
 
         // Update a pre-allocated box with a random pose, orientation, color, opacity, and handles
         function updateRandomBox(box, color = "red", opacity=0.5, withHandles = false) {
+            
+
             // Sample x, y uniformly from an annulus (ring) between inner and outer radius
             const innerR = 1.5;
             const outerR = 0.8;
@@ -174,8 +145,13 @@
             if (box.position.y < y_bounds[0]) box.position.y = y_bounds[0];
             if (box.position.y > y_bounds[1]) box.position.y = y_bounds[1];
 
+            let pitch_headroom = Math.max(y_bounds[1] - box.position.y - 0.1, 0);
+            pitch_headroom = Math.max(pitch_headroom, box.position.y - 0.1);
+            let max_pitch = Math.asin(Math.min(pitch_headroom/ (box_width/2), 1.0));
+
             // Random orientation
-            const pitch = degToRad(Math.random() * (pitch_range[1] - pitch_range[0]) + pitch_range[0]);
+            let pitch = degToRad(Math.random() * (pitch_range[1] - pitch_range[0]) + pitch_range[0]);
+            pitch = Math.max(-max_pitch, Math.min(pitch, max_pitch));
             let roll;
             if (box.position.y < 0.3 || box.position.y > 1.8 ) {
                 roll = 0;
@@ -195,10 +171,11 @@
             return box;
         }
 
+        let box_width = 0.8
         // Add a new box at a random pose and orientation, with configurable color
         function createRandomBox(color, opacity, withHandles) {
-            // Box dimensions: [0.4, 0.2, 0.2]
-            const geometry = new THREE.BoxGeometry(0.4, 0.2, 0.2);
+            // Box dimensions: [box_width, 0.2, 0.2]
+            const geometry = new THREE.BoxGeometry(box_width, 0.2, 0.2);
             let material = new THREE.MeshStandardMaterial({ color: color, transparent: true, opacity: opacity });
             const box = new THREE.Mesh(geometry, material);
             if (withHandles) {
@@ -206,9 +183,9 @@
                 let leftMat = new THREE.MeshStandardMaterial({ color: 'gray', transparent: true, opacity: 0.5 });
                 let rightMat = new THREE.MeshStandardMaterial({ color: 'gray', transparent: true, opacity: 0.5 });
                 box.left_handle = new THREE.Mesh(geom, leftMat);
-                box.left_handle.position.set(-0.2, 0, 0);
+                box.left_handle.position.set(-box_width/2, 0, 0);
                 box.right_handle = new THREE.Mesh(geom, rightMat);
-                box.right_handle.position.set(0.2, 0, 0);
+                box.right_handle.position.set(box_width/2, 0, 0);
                 box.add(box.left_handle);
                 box.add(box.right_handle);
             }
@@ -278,101 +255,58 @@
             return group;
         }
 
-        // Helper: check collision between a finger tip and a box
-        function isCollidingWithBox(fingerTip, box) {
-            if (!fingerTip || !box) return false;
-            // Ensure world matrices are up to date
+        // Helper: check collision between a controller and a box (using controller root position)
+        function isCollidingWithBox(controller, box) {
+            if (!controller || !box) return false;
             box.updateMatrixWorld();
-            // Create a Box3 in world space
             const box3 = new THREE.Box3().setFromObject(box);
-            // Use the world position of the finger tip
-            const tipPos = new THREE.Vector3();
-            fingerTip.getWorldPosition(tipPos);
-            return box3.containsPoint(tipPos);
+            const ctrlPos = new THREE.Vector3();
+            controller.getWorldPosition(ctrlPos);
+            return box3.containsPoint(ctrlPos);
         }
 
          // Compute and apply the average world transform of currentBox from left and right palm
-        function updateCurrentBoxFromPalms() {
+        // Update currentBox pose from controllers
+        function updateCurrentBoxFromControllers() {
             if (!currentBox) return;
-            // Both transforms must be available
-            if (!lpalm_T_currentBox && !rpalm_T_currentBox) return;
-            // Helper to get palm world matrix
-            function getPalmWorldMatrix(hand) {
-                if (hand && hand.palm_sphere) {
-                    return hand.palm_sphere.matrixWorld;
-                }
-                return null;
-            }
-            // Compute candidate world matrices
+            if (!lcontroller_T_currentBox && !rcontroller_T_currentBox) return;
             let leftWorld = null, rightWorld = null;
-            if (lpalm_T_currentBox && hand0 && hand0_handedness === 'left') {
-                const palmWorld = getPalmWorldMatrix(hand0);
-                if (palmWorld) {
-                    leftWorld = new THREE.Matrix4().multiplyMatrices(palmWorld, lpalm_T_currentBox);
-                }
-            } else if (lpalm_T_currentBox && hand1 && hand1_handedness === 'left') {
-                const palmWorld = getPalmWorldMatrix(hand1);
-                if (palmWorld) {
-                    leftWorld = new THREE.Matrix4().multiplyMatrices(palmWorld, lpalm_T_currentBox);
-                }
+            if (lcontroller_T_currentBox && controllerLeft) {
+                leftWorld = new THREE.Matrix4().multiplyMatrices(controllerLeft.matrixWorld, lcontroller_T_currentBox);
             }
-            if (rpalm_T_currentBox && hand0 && hand0_handedness === 'right') {
-                const palmWorld = getPalmWorldMatrix(hand0);
-                if (palmWorld) {
-                    rightWorld = new THREE.Matrix4().multiplyMatrices(palmWorld, rpalm_T_currentBox);
-                }
-            } else if (rpalm_T_currentBox && hand1 && hand1_handedness === 'right') {
-                const palmWorld = getPalmWorldMatrix(hand1);
-                if (palmWorld) {
-                    rightWorld = new THREE.Matrix4().multiplyMatrices(palmWorld, rpalm_T_currentBox);
-                }
+            if (rcontroller_T_currentBox && controllerRight) {
+                rightWorld = new THREE.Matrix4().multiplyMatrices(controllerRight.matrixWorld, rcontroller_T_currentBox);
             }
-            // If both available, average them; else use whichever is available
             let finalMatrix = null;
             if (leftWorld && rightWorld) {
-                // Decompose both matrices
+                // Average position and orientation as before
                 const lpos = new THREE.Vector3(), lquat = new THREE.Quaternion(), lscale = new THREE.Vector3();
                 const rpos = new THREE.Vector3(), rquat = new THREE.Quaternion(), rscale = new THREE.Vector3();
                 leftWorld.decompose(lpos, lquat, lscale);
                 rightWorld.decompose(rpos, rquat, rscale);
-                // Average position
                 const avgPos = new THREE.Vector3().addVectors(lpos, rpos).multiplyScalar(0.5);
-                // --- Optimal rotation to align handle vectors (least-squares) ---
-                // Get handle positions in box local space
-                const leftHandleLocal = new THREE.Vector3(-0.2, 0, 0);
-                const rightHandleLocal = new THREE.Vector3(0.2, 0, 0);
-                // Transform to world using leftWorld and rightWorld
+                // Handle vector logic as before
+                const leftHandleLocal = new THREE.Vector3(-box_width/2, 0, 0);
+                const rightHandleLocal = new THREE.Vector3(box_width/2, 0, 0);
                 const leftHandleWorld = leftHandleLocal.clone().applyMatrix4(leftWorld);
                 const rightHandleWorld = rightHandleLocal.clone().applyMatrix4(rightWorld);
-                // The original handle vector in box local space
                 const origVec = new THREE.Vector3().subVectors(rightHandleLocal, leftHandleLocal).normalize();
-                // The current handle vector in world space
                 const currVec = new THREE.Vector3().subVectors(rightHandleWorld, leftHandleWorld).normalize();
-                // Compute rotation quaternion that rotates origVec to currVec, but preserve average twist about the axis
                 let alignQuat = new THREE.Quaternion();
                 if (origVec.lengthSq() > 0 && currVec.lengthSq() > 0) {
                     alignQuat.setFromUnitVectors(origVec, currVec);
                 } else {
                     alignQuat.identity();
                 }
-
                 const alignPos = new THREE.Vector3().addVectors(leftHandleWorld, rightHandleWorld).multiplyScalar(0.5);
-
-                // --- New logic: average up vectors and construct rotation from axes ---
-                // Get the up vector (Y axis) in box local space
+                // Up vector logic
                 const upLocal = new THREE.Vector3(0, 1, 0);
-                // Left hand: up vector in world, relative to leftWorld
                 const lUpWorld = upLocal.clone().applyQuaternion(lquat);
-                // Right hand: up vector in world, relative to rightWorld
                 const rUpWorld = upLocal.clone().applyQuaternion(rquat);
-                // Average and normalize up vectors
                 const avgUpWorld = lUpWorld.clone().add(rUpWorld).normalize();
-                // Construct rotation matrix: x-axis = currVec, y-axis = avgUpWorld, z-axis = x cross y
                 const xAxis = currVec.clone().normalize();
                 let yAxis = avgUpWorld.clone();
-                // Ensure yAxis is not parallel to xAxis
                 if (Math.abs(xAxis.dot(yAxis)) > 0.99) {
-                    // If nearly parallel, pick a fallback up
                     yAxis = new THREE.Vector3(0, 1, 0);
                     if (Math.abs(xAxis.dot(yAxis)) > 0.99) {
                         yAxis = new THREE.Vector3(0, 0, 1);
@@ -380,13 +314,10 @@
                 }
                 yAxis.projectOnPlane(xAxis).normalize();
                 const zAxis = new THREE.Vector3().crossVectors(xAxis, yAxis).normalize();
-                // Re-orthogonalize yAxis
                 yAxis.crossVectors(zAxis, xAxis).normalize();
-                // Build rotation matrix
                 const rotMat = new THREE.Matrix4();
                 rotMat.makeBasis(xAxis, yAxis, zAxis);
                 const finalQuat = new THREE.Quaternion().setFromRotationMatrix(rotMat);
-                // Compose final matrix: avgPos, finalQuat, avgScale
                 const avgScale = new THREE.Vector3().addVectors(lscale, rscale).multiplyScalar(0.5);
                 finalMatrix = new THREE.Matrix4().compose(alignPos, finalQuat, avgScale);
             } else if (leftWorld) {
@@ -400,166 +331,105 @@
             }
         }
         
-        function onHand0PinchStart() {
-            if (hand0_handedness == 'left') {
-                onPinchStartLeft(hand0);
-            } else if (hand0_handedness == 'right') {
-                onPinchStartRight(hand0);
-            }
-        }
-        function onHand0PinchEnd() {
-            if (hand0_handedness === 'left') {
-                onPinchEndLeft(hand0);
-            } else if (hand0_handedness === 'right') {
-                onPinchEndRight(hand0);
-            }
-        }
-        function onHand1PinchStart() {
-            if (hand1_handedness === 'left') {
-                onPinchStartLeft(hand1);
-            } else if (hand1_handedness === 'right') {
-                onPinchStartRight(hand1);
-            }
-        }
-        function onHand1PinchEnd() {
-            if (hand1_handedness === 'left') {
-                onPinchEndLeft(hand1);
-            } else if (hand1_handedness === 'right') {
-                onPinchEndRight(hand1);
-            }
-        }
+        // No hand pinch events: use controller events instead
 
-        let lpalm_T_currentBox = null;
-        function doLeftGrabStart(leftHand) {
-            if (!leftHand || !currentBox) return;
-            // Get the palm sphere
-            const palmSphere = leftHand.palm_sphere;
-            if (palmSphere && currentBox.left_handle) {
+        let lcontroller_T_currentBox = null;
+        function doLeftGrabStart() {
+            if (!controllerLeft || !currentBox) return;
+            if (currentBox.left_handle && leftControllerSphere) {
                 // Get world positions
-                const palmPos = new THREE.Vector3();
-                palmSphere.getWorldPosition(palmPos);
+                const ctrlPos = new THREE.Vector3();
+                leftControllerSphere.getWorldPosition(ctrlPos);
                 const handlePos = new THREE.Vector3();
                 currentBox.left_handle.getWorldPosition(handlePos);
-                const dist = palmPos.distanceTo(handlePos);
+                const dist = ctrlPos.distanceTo(handlePos);
+                console.log("Left controller distance to handle:", dist);
                 if (dist <= handleRadius) {
-                    // Compute the relative transform from palmSphere to currentBox
-                    // lpalm_T_currentBox = palmSphere.matrixWorld^-1 * currentBox.matrixWorld
-                    const palmInv = new THREE.Matrix4().copy(palmSphere.matrixWorld).invert();
+                    // Compute the relative transform from controller to currentBox
+                    // lcontroller_T_currentBox = controller.matrixWorld^-1 * currentBox.matrixWorld
+                    const ctrlInv = new THREE.Matrix4().copy(controllerLeft.matrixWorld).invert();
                     const boxMat = new THREE.Matrix4().copy(currentBox.matrixWorld);
-                    lpalm_T_currentBox = new THREE.Matrix4().multiplyMatrices(palmInv, boxMat);
+                    lcontroller_T_currentBox = new THREE.Matrix4().multiplyMatrices(ctrlInv, boxMat);
                     currentBox.left_handle.material.color.set('green');
                     has_been_grasped = true;
                 }
             }
         }
 
-        function onPinchStartLeft(leftHand) {
-            // Pinch callbacks are now empty
+        function onXButtonLeft() {
+            // X button callback: same as left pinch
+            //doLeftGrabStart();
+            restartTask();
+            console.log("X button pressed on left controller");
         }
 
-        function doLeftGrabEnd(leftHand) {
+        function doLeftGrabEnd() {
             if (currentBox) {
                 scene.attach(currentBox);
                 if (currentBox.left_handle) currentBox.left_handle.material.color.set('gray');
             }
-            lpalm_T_currentBox = null;
+            lcontroller_T_currentBox = null;
         }
 
-        function onPinchEndLeft(leftHand) {
-            // Pinch callbacks are now empty
-            restartTask();
+        function onXButtonLeftRelease() {
+            // X button release: same as left pinch end
+            //doLeftGrabEnd();
         }
 
-        // Draw a sphere at the right index tip while pinching
-        let rpalm_T_currentBox = null;
-        function doRightGrabStart(rightHand) {
-            if (!rightHand || !currentBox) return;
-            // Get the palm sphere
-            const palmSphere = rightHand.palm_sphere;
-            if (palmSphere && currentBox.right_handle) {
-                // Get world positions
-                const palmPos = new THREE.Vector3();
-                palmSphere.getWorldPosition(palmPos);
+        let rcontroller_T_currentBox = null;
+        function doRightGrabStart() {
+            if (!controllerRight || !currentBox) return;
+            if (currentBox.right_handle && rightControllerSphere) {
+                const ctrlPos = new THREE.Vector3();
+                rightControllerSphere.getWorldPosition(ctrlPos);
                 const handlePos = new THREE.Vector3();
                 currentBox.right_handle.getWorldPosition(handlePos);
-                const dist = palmPos.distanceTo(handlePos);
+                const dist = ctrlPos.distanceTo(handlePos);
                 if (dist <= handleRadius) {
-                    // Compute the relative transform from palmSphere to currentBox
-                    // rpalm_T_currentBox = palmSphere.matrixWorld^-1 * currentBox.matrixWorld
-                    const palmInv = new THREE.Matrix4().copy(palmSphere.matrixWorld).invert();
+                    const ctrlInv = new THREE.Matrix4().copy(controllerRight.matrixWorld).invert();
                     const boxMat = new THREE.Matrix4().copy(currentBox.matrixWorld);
-                    rpalm_T_currentBox = new THREE.Matrix4().multiplyMatrices(palmInv, boxMat);
+                    rcontroller_T_currentBox = new THREE.Matrix4().multiplyMatrices(ctrlInv, boxMat);
                     currentBox.right_handle.material.color.set('green');
                     has_been_grasped = true;
                 }
             }
         }
 
-        function onPinchStartRight(rightHand) {
-            // Pinch callbacks are now empty
-        }
+        // No right pinch event: use trigger button
 
-        // Called when right hand pinch ends
-        function doRightGrabEnd(rightHand) {
+        function doRightGrabEnd() {
             if (currentBox) {
                 scene.attach(currentBox);
                 if (currentBox.right_handle) currentBox.right_handle.material.color.set('gray');
             }
-            rpalm_T_currentBox = null;
+            rcontroller_T_currentBox = null;
         }
 
-        function onPinchEndRight(rightHand) {
-            // Pinch callbacks are now empty
-        }
+        // No right pinch end event
 
-                // --- Fist open/close event detection ---
-        let leftHandWasFist = false;
-        let rightHandWasFist = false;
+        // --- Controller trigger/button event detection ---
+        let leftTriggerPressed = false;
+        let rightTriggerPressed = false;
+        let leftXPressed = false;
 
-        function setHandModelColor(hand, color) {
-            if (hand && hand.children) {
-                hand.traverse(obj => {
-                    if (obj.isMesh && obj.material) {
-                        if (color === 'green') {
-                            if (!obj.material._origColor) {
-                                obj.material._origColor = obj.material.color.clone();
-                            }
-                            obj.material.color.set('green');
-                        } else if (obj.material._origColor) {
-                            obj.material.color.copy(obj.material._origColor);
-                        }
-                    }
-                });
-            }
-        }
-
-        function onLeftHandFistClosed(hand) {
-            //console.log("Left hand fist closed", hand);
-            setHandModelColor(hand, 'green');
-            doLeftGrabStart(hand);
-        }
-        function onLeftHandFistOpened(hand) {
-            //console.log("Left hand fist opened", hand);
-            setHandModelColor(hand, 'restore');
-            doLeftGrabEnd(hand);
-        }
-        function onRightHandFistClosed(hand) {
-            //console.log("Right hand fist closed", hand);
-            setHandModelColor(hand, 'green');
-            doRightGrabStart(hand);
-        }
-        function onRightHandFistOpened(hand) {
-            //console.log("Right hand fist opened", hand);
-            setHandModelColor(hand, 'restore');
-            doRightGrabEnd(hand);
+        // Draw a yellow sphere at the controller root
+        let leftControllerSphere = null;
+        let rightControllerSphere = null;
+        function addControllerSphere(controller, isLeft) {
+            if (!controller) return;
+            const geom = new THREE.SphereGeometry(0.02, 24, 24);
+            const mat = new THREE.MeshStandardMaterial({ color: 0xffff00, emissive: 0xffff00, emissiveIntensity: 0.5 });
+            const sphere = new THREE.Mesh(geom, mat);
+            controller.add(sphere);
+            sphere.position.set(0, -0.0, -0.0);
+            if (isLeft) leftControllerSphere = sphere;
+            else rightControllerSphere = sphere;
         }
 
         function restartTask() {
             has_been_grasped = false;
-            // Add new red box
             currentBox = updateRandomBox(currentBox, "red", 1.0, true);
             scene.add(currentBox);
-            // Add new target (blue) box
             targetBox = updateRandomBox(targetBox, "blue", 0.5);
             scene.add(targetBox);
         }
@@ -570,7 +440,6 @@
                     const supported = await navigator.xr.isSessionSupported(
                         "immersive-ar"
                     );
-                    // Check if immersive AR with local-floor is supported
                     if (supported) {
                         webXRButton.textContent = "Enter AR";
                         webXRButton.disabled = false;
@@ -601,15 +470,7 @@
                 0.1,
                 1000,
             );
-            scene.add(camera); // Add camera to scene so its transform is updated by WebXR
-
-            // // Create a simple cube
-            // const geometry = new THREE.BoxGeometry(0.2, 0.2, 0.2); // 20cm cube
-            // const material = new THREE.MeshStandardMaterial({ color: "lime", transparent: true, opacity: 0.5 }); // Green
-            // cube = new THREE.Mesh(geometry, material);
-            // cube.position.set(0, 1, -1);
-            // scene.add(cube);
-          
+            scene.add(camera);
 
             // Add some light
             const ambientLight = new THREE.AmbientLight("white", 0.6);
@@ -625,65 +486,56 @@
             renderer.xr.enabled = true;
             document.body.appendChild(renderer.domElement);
 
-            // Add controller objects to the scene after renderer is created
-            controller = renderer.xr.getController(0);
-            scene.add(controller);
 
-            controllerGrip = renderer.xr.getControllerGrip(0);
-            scene.add(controllerGrip);
+            // Add two generic controller objects
+            const controller0 = renderer.xr.getController(0);
+            const controller1 = renderer.xr.getController(1);
+            scene.add(controller0);
+            scene.add(controller1);
 
-            // Add hand objects
-            hand0 = renderer.xr.getHand(0);
-            hand1 = renderer.xr.getHand(1);
-            hand0.addEventListener('pinchend', onHand0PinchEnd);
-            hand0.addEventListener('pinchstart', onHand0PinchStart);
-            hand1.addEventListener('pinchend', onHand1PinchEnd);
-            hand1.addEventListener('pinchstart', onHand1PinchStart);
+            const controllerGrip0 = renderer.xr.getControllerGrip(0);
+            const controllerGrip1 = renderer.xr.getControllerGrip(1);
+            scene.add(controllerGrip0);
+            scene.add(controllerGrip1);
 
-            hand0.addEventListener('connected', (event) => {
-                hand0_handedness = event.data.handedness;
-            });
-            hand1.addEventListener('connected', (event) => {
-                hand1_handedness = event.data.handedness;
-            });
-
-            scene.add(hand0);
-            scene.add(hand1);
-
-
-            // Add hand models using XRHandModelFactory (for visible hand meshes)
-            const handModelFactory = new XRHandModelFactory();
-            hand0Model = handModelFactory.createHandModel(hand0, "mesh");
-            hand1Model = handModelFactory.createHandModel(hand1, "mesh");
-            hand0.add(hand0Model);
-            hand1.add(hand1Model);
-
-            // Add yellow spheres to the wrist joint of each hand (radius 5cm)
-            hand0.palm_sphere = null;
-            hand1.palm_sphere = null;
-            function addPalmSphere(hand) {
-                if (!hand || !hand.joints) return;
-                const wrist = hand.joints["wrist"];
-                if (wrist && !wrist.getObjectByName("palm-sphere")) {
-                    const geom = new THREE.SphereGeometry(0.02, 24, 24);
-                    const mat = new THREE.MeshStandardMaterial({ color: 0xffff00, emissive: 0xffff00, emissiveIntensity: 0.5 });
-                    hand.palm_sphere  = new THREE.Mesh(geom, mat);
-                    wrist.add(hand.palm_sphere);
-                    hand.palm_sphere .position.set(0,-0.05,-0.1);
-                    //wrist.add(createCoordinateFrame(0.05)); // Add small coordinate frame to palm sphere
-                }
+            // Assign controllers based on handedness when connected
+            function setupController(controller, grip) {
+                controller.addEventListener('connected', (event) => {
+                    if (event.data && event.data.handedness) {
+                        if (event.data.handedness === 'left') {
+                            controllerLeft = controller;
+                            controllerGripLeft = grip;
+                            addControllerSphere(controllerLeft, true);
+                            // Listen for trigger (select) events
+                            controllerLeft.addEventListener('selectstart', () => {
+                                leftTriggerPressed = true;
+                                doLeftGrabStart();
+                            });
+                            controllerLeft.addEventListener('selectend', () => {
+                                leftTriggerPressed = false;
+                                doLeftGrabEnd();
+                            });
+                        } else if (event.data.handedness === 'right') {
+                            controllerRight = controller;
+                            controllerGripRight = grip;
+                            addControllerSphere(controllerRight, false);
+                            controllerRight.addEventListener('selectstart', () => {
+                                rightTriggerPressed = true;
+                                doRightGrabStart();
+                            });
+                            controllerRight.addEventListener('selectend', () => {
+                                rightTriggerPressed = false;
+                                doRightGrabEnd();
+                            });
+                        }
+                    }
+                });
             }
-            // Try to add immediately, and also on hand connection (for robustness)
-            hand0.addEventListener('connected', () => setTimeout(() => addPalmSphere(hand0), 100));
-            hand1.addEventListener('connected', () => setTimeout(() => addPalmSphere(hand1), 100));
-
-
-            // Listen for select events (trigger button)
-            // controller.addEventListener('selectstart', onSelectStart);
-            // controller.addEventListener('selectend', onSelectEnd);
+            setupController(controller0, controllerGrip0);
+            setupController(controller1, controllerGrip1);
 
             window.addEventListener("resize", onWindowResize, false);
-            restartTask()
+            restartTask();
         }
 
         async function onEnterAR() {
@@ -862,19 +714,42 @@
         }
 
         function render(timestamp, frame) {
-            dispatch_fist_callbacks();
+            // Poll X button state (left controller) using inputSource.gamepad for up-to-date reference
+            const inputSources = xrSession.inputSources;
+            for (const source of inputSources) {
+                if (source && source.gamepad && source.handedness === "left") {
+                    const gamepad = source.gamepad;
+                    // Print if any button is pressed
+                    if (gamepad.buttons && gamepad.buttons.length > 0) {
+                        for (let i = 0; i < gamepad.buttons.length; i++) {
+                            if (gamepad.buttons[i].pressed) {
+                                console.log(`Gamepad button ${i} pressed`);
+                            }
+                        }
+                    }
+                    // X button is usually button[3] on left Oculus Touch
+                    if (gamepad.buttons && gamepad.buttons.length > 4) {
+                        const pressed = gamepad.buttons[4].pressed;
+                        if (pressed && !leftXPressed) {
+                            leftXPressed = true;
+                            onXButtonLeft();
+                        } else if (!pressed && leftXPressed) {
+                            leftXPressed = false;
+                            onXButtonLeftRelease();
+                        }
+                    }
+                }
+            }
 
             if (!xrSession || !frame) return;
 
-            // If both palm-to-box transforms are set, update box pose from palms
-            if (has_been_grasped && (lpalm_T_currentBox || rpalm_T_currentBox)) {
-                updateCurrentBoxFromPalms();
+            // If both controller-to-box transforms are set, update box pose from controllers
+            if (has_been_grasped && (lcontroller_T_currentBox || rcontroller_T_currentBox)) {
+                updateCurrentBoxFromControllers();
             }
 
             drawBoxLines();
-
             handleBoxMatchAndTimer();
-
             renderer.render(scene, camera);
         }
 
